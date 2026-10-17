@@ -7,6 +7,7 @@
 #include <vector>
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
 
 #if defined(_WIN32)
 #include <windows.h>
