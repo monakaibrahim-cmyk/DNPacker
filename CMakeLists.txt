@@ -18,7 +18,7 @@ if(BUILD_STATIC)
     else()
         # GCC / Clang on Linux
         if(NOT APPLE)
-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
         endif()
     endif()
 endif()
