@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+build_*/
+bin/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.dir/
+
+# Compiled Binaries & Libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Object files
+*.obj
+*.o
+
+# IDE / Editor folders
+.vs/
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+*.user
+
+# Runtime generated files
+keys.txt
+*.pak
+*.log
