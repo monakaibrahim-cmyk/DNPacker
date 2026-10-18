@@ -8,6 +8,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <memory>
 
 namespace fs = std::filesystem;
 
@@ -78,14 +79,15 @@ bool PakArchive::Open(const fs::path& pakPath) {
         return false;
     }
 
-    // Validate magic prefix "EyedentityGames Packing File 01"
-    if (std::memcmp(m_header.magic, PAK_MAGIC, std::strlen(PAK_MAGIC)) != 0) {
+    // Validate magic prefix ("EyedentityGames Packing File")
+    // Supports both "EyedentityGames Packing File 0.1" (v10 / old archives) and "EyedentityGames Packing File 01" (v11)
+    if (std::strncmp(m_header.magic, PAK_MAGIC_PREFIX, std::strlen(PAK_MAGIC_PREFIX)) != 0) {
         Close();
         return false;
     }
 
-    // Validate version (Version 10 or 11 supported)
-    if (m_header.version != 10 && m_header.version != 11) {
+    // Validate version (Version 10, 11, and legacy versions supported)
+    if (m_header.version > 100) {
         Close();
         return false;
     }
@@ -94,11 +96,24 @@ bool PakArchive::Open(const fs::path& pakPath) {
         return true; // Empty archive is technically valid
     }
 
+    // Determine File Entry Table Offset:
+    // In v11: m_header.tableOffset is stored explicitly.
+    // In v10 / old archives: table is located at the end of the file if tableOffset == 0.
+    uint64_t tableOffset = m_header.tableOffset;
+    if (tableOffset == 0 || m_header.version < 11) {
+        PortableFileSeek64(m_pFile, 0, SEEK_END);
+        int64_t fileSize = PortableFileTell64(m_pFile);
+        uint64_t expectedOffset = static_cast<uint64_t>(fileSize) - (static_cast<uint64_t>(m_header.fileCount) * sizeof(PakEntryRaw));
+        if (tableOffset == 0 || tableOffset > static_cast<uint64_t>(fileSize)) {
+            tableOffset = expectedOffset;
+        }
+    }
+
     // 2. Read File Entry Table (316 bytes per entry)
     std::vector<PakEntryRaw> rawEntries(m_header.fileCount);
     size_t tableSize = static_cast<size_t>(m_header.fileCount) * sizeof(PakEntryRaw);
 
-    if (!ReadBytes(m_header.tableOffset, rawEntries.data(), tableSize)) {
+    if (!ReadBytes(tableOffset, rawEntries.data(), tableSize)) {
         Close();
         return false;
     }
@@ -164,8 +179,8 @@ bool PakArchive::ExtractFile(const PakEntry& entry, std::vector<uint8_t>& outDat
     size_t compressedLen = rawPayload.size();
     std::vector<uint8_t> decryptedBody;
 
-    // Check EwAF256 encryption
-    if (rawPayload.size() >= 16) {
+    // Check EwAF256 encryption only if file entry is marked encrypted
+    if (entry.isEncrypted && rawPayload.size() >= 16) {
         uint8_t decHeader[16];
         if (headerCipher.DecryptBlock(rawPayload.data(), decHeader)) {
             if (std::memcmp(decHeader, ENCRYPTION_MAGIC, 7) == 0) {
@@ -259,13 +274,38 @@ bool PakArchive::UnpackAll(const fs::path& outputDir, const std::string& filter)
             continue;
         }
 
-        // Sanitize path (convert backslashes to forward slashes for filesystem)
+        // Sanitize path:
+        // 1. Strip drive letter if present (e.g. C:)
+        // 2. Strip leading slashes/backslashes so std::filesystem does not resolve to drive root
+        // 3. Prevent directory traversal attacks (.. and .)
         std::string cleanName = entry.filename;
+        if (cleanName.size() >= 2 && cleanName[1] == ':' && std::isalpha(static_cast<unsigned char>(cleanName[0]))) {
+            cleanName = cleanName.substr(2);
+        }
+
+        size_t startPos = 0;
+        while (startPos < cleanName.size() && (cleanName[startPos] == '/' || cleanName[startPos] == '\\')) {
+            startPos++;
+        }
+        cleanName = cleanName.substr(startPos);
+
         for (char& c : cleanName) {
             if (c == '\\') c = '/';
         }
 
-        fs::path outFilePath = outputDir / cleanName;
+        fs::path relPath(cleanName);
+        fs::path sanitizedRelPath;
+        for (const auto& part : relPath) {
+            if (part == ".." || part == ".") continue;
+            sanitizedRelPath /= part;
+        }
+
+        if (sanitizedRelPath.empty()) {
+            std::cerr << "[-] Skipping invalid entry filename: " << entry.filename << "\n";
+            continue;
+        }
+
+        fs::path outFilePath = outputDir / sanitizedRelPath;
         fs::create_directories(outFilePath.parent_path());
 
         std::ofstream outFile(outFilePath, std::ios::binary);
@@ -277,6 +317,8 @@ bool PakArchive::UnpackAll(const fs::path& outputDir, const std::string& filter)
             std::cout << "[" << (i + 1) << "/" << total << "] Extracted: " << entry.filename;
             if (entry.isEncrypted) {
                 std::cout << " [Enc: 0x" << std::hex << std::uppercase << entry.keyId << std::dec << "]";
+            } else {
+                std::cout << " [Unencrypted]";
             }
             std::cout << " (" << data.size() << " bytes)\n";
         } else {
@@ -310,7 +352,7 @@ void PakArchive::List(const std::string& filter) const {
             status = ss.str();
         }
 
-        std::cout << "0x" << std::hex << std::setw(8) << std::setfill('0') << e.offset << std::dec << "  "
+        std::cout << "0x" << std::hex << std::right << std::setw(8) << std::setfill('0') << e.offset << std::dec << "  "
                   << std::left << std::setw(14) << std::setfill(' ') << e.compressedSize
                   << std::setw(14) << e.uncompressedSize
                   << std::setw(16) << status
@@ -322,7 +364,8 @@ bool PakArchive::Pack(
     const fs::path& sourceDir,
     const fs::path& pakPath,
     bool encrypt,
-    uint32_t keyId
+    uint32_t keyId,
+    bool oldFormat
 ) {
     if (!fs::exists(sourceDir) || !fs::is_directory(sourceDir)) {
         std::cerr << "[-] Source directory does not exist: " << sourceDir.string() << "\n";
@@ -337,6 +380,12 @@ bool PakArchive::Pack(
     }
 
     std::cout << "Packing " << filePaths.size() << " files into '" << pakPath.string() << "'...\n";
+    if (!encrypt || oldFormat) {
+        std::cout << "[i] Packing Mode: Old / Unencrypted (Version " << (oldFormat ? "10" : "11") << ", Standard Deflate)\n";
+    } else {
+        std::cout << "[i] Packing Mode: Modern Encrypted (Version 11, AES-256 Key ID: 0x"
+                  << std::hex << std::uppercase << keyId << std::dec << ")\n";
+    }
 
     FILE* pOut = PortableFileOpen(pakPath, "wb");
     if (!pOut) {
@@ -349,14 +398,19 @@ bool PakArchive::Pack(
     std::fwrite(zeroHeader, 1, sizeof(zeroHeader), pOut);
 
     // Initialize encryption ciphers if enabled
-    uint8_t headerKeyBytes[32];
-    GetAES256Key(HEADER_KEY_STR, headerKeyBytes);
-    AES256ECB headerCipher(headerKeyBytes);
+    uint8_t headerKeyBytes[32]{};
+    uint8_t dataKeyBytes[32]{};
+    std::unique_ptr<AES256ECB> headerCipher;
+    std::unique_ptr<AES256ECB> dataCipher;
 
-    std::string dataKeyStr = GetKeyString(keyId);
-    uint8_t dataKeyBytes[32];
-    GetAES256Key(dataKeyStr, dataKeyBytes);
-    AES256ECB dataCipher(dataKeyBytes);
+    if (encrypt && !oldFormat) {
+        GetAES256Key(HEADER_KEY_STR, headerKeyBytes);
+        headerCipher = std::make_unique<AES256ECB>(headerKeyBytes);
+
+        std::string dataKeyStr = GetKeyString(keyId);
+        GetAES256Key(dataKeyStr, dataKeyBytes);
+        dataCipher = std::make_unique<AES256ECB>(dataKeyBytes);
+    }
 
     std::vector<PakEntryRaw> rawTable;
     rawTable.reserve(filePaths.size());
@@ -401,7 +455,7 @@ bool PakArchive::Pack(
         uint32_t fileOffset = static_cast<uint32_t>(curPos);
 
         std::vector<uint8_t> finalPayload;
-        if (encrypt) {
+        if (encrypt && !oldFormat && headerCipher && dataCipher) {
             // Build 16-byte header: EwAF256 + 8 hex chars + \0
             uint8_t headerPlain[16]{};
             std::memcpy(headerPlain, ENCRYPTION_MAGIC, 7);
@@ -411,16 +465,17 @@ bool PakArchive::Pack(
             headerPlain[15] = 0;
 
             uint8_t encHdr[16];
-            headerCipher.EncryptBlock(headerPlain, encHdr);
+            headerCipher->EncryptBlock(headerPlain, encHdr);
 
             // Pad compressed data with PKCS#7 to 16-byte boundary
             std::vector<uint8_t> paddedData = AES256ECB::AddPKCS7Padding(compBuffer.data(), compBuffer.size());
-            std::vector<uint8_t> encBody = dataCipher.Encrypt(paddedData.data(), paddedData.size());
+            std::vector<uint8_t> encBody = dataCipher->Encrypt(paddedData.data(), paddedData.size());
 
             finalPayload.resize(16 + encBody.size());
             std::memcpy(finalPayload.data(), encHdr, 16);
             std::memcpy(finalPayload.data() + 16, encBody.data(), encBody.size());
         } else {
+            // Old / Unencrypted format: directly write standard zlib compressed stream
             finalPayload = std::move(compBuffer);
         }
 
@@ -436,25 +491,27 @@ bool PakArchive::Pack(
         rawTable.push_back(rawEntry);
     }
 
-    // 2. Write File Entry Table
+    // 2. Write File Entry Table at end of file
     int64_t tablePos = PortableFileTell64(pOut);
     uint32_t tableOffset = static_cast<uint32_t>(tablePos);
 
     std::fwrite(rawTable.data(), sizeof(PakEntryRaw), rawTable.size(), pOut);
 
-    // 3. Write Actual Header (Version 11)
+    // 3. Write Archive Header at offset 0
     PortableFileSeek64(pOut, 0, SEEK_SET);
 
     PakHeaderRaw finalHdr{};
-    SafeStrCopy(finalHdr.magic, sizeof(finalHdr.magic), PAK_MAGIC);
-    finalHdr.version = 11;
+    // For oldFormat use classic "EyedentityGames Packing File 0.1", for modern use "EyedentityGames Packing File 01"
+    const char* magicStr = oldFormat ? PAK_MAGIC_V10 : PAK_MAGIC;
+    SafeStrCopy(finalHdr.magic, sizeof(finalHdr.magic), magicStr);
+    finalHdr.version = oldFormat ? 10 : 11;
     finalHdr.fileCount = static_cast<uint32_t>(rawTable.size());
     finalHdr.tableOffset = tableOffset;
 
     std::fwrite(&finalHdr, 1, sizeof(finalHdr), pOut);
     std::fclose(pOut);
 
-    std::cout << "Packing completed successfully! Output: " << pakPath.string() << "\n";
+    std::cout << "[+] Packing completed successfully! Output: " << pakPath.string() << "\n";
     return true;
 }
 

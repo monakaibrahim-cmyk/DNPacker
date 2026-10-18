@@ -17,11 +17,11 @@ High-performance, cross-platform C++ archive packer, unpacker, and key extractor
   - Windows: Hardware-accelerated AES-NI via Windows CNG (`bcrypt.dll`).
   - Linux / POSIX: Optimized, self-contained portable AES-256-ECB engine.
 - **Drag & Drop (Windows Explorer)**:
-  - Drag a `.pak` archive onto `dnpacker` $\rightarrow$ automatically unpacks to a folder.
-  - Drag a folder onto `dnpacker` $\rightarrow$ automatically packs into a `.pak` file.
+  - Drag a `.pak` archive onto `dnpacker` $\rightarrow$ automatically detects format (Modern or Legacy) and unpacks to a folder.
+  - Drag a folder onto `dnpacker` $\rightarrow$ prompts you to choose between **Modern Encrypted (AES-256)** or **Old Unencrypted (Version 10 / Classic)**.
   - Drag `dragonnest_x64.exe` onto `dnpacker` $\rightarrow$ automatically scans and extracts all 36+ encryption keys into `keys.txt`.
 - **Dynamic Key Extraction**: Includes a PE opcode scanner that recovers fresh archive encryption keys directly from updated `dragonnest_x64.exe` binaries.
-- **Full Version 10 & 11 PAK Support**: Complete support for both modern and legacy Dragon Nest archive formats.
+- **Full Version 10 & 11 PAK Support**: Complete support for both modern (AES-256 encrypted, Version 11) and legacy (classic unencrypted deflate, Version 10) Dragon Nest archives.
 
 ---
 
@@ -30,10 +30,10 @@ High-performance, cross-platform C++ archive packer, unpacker, and key extractor
 ### 1. Archive Header (272 bytes / `0x110`)
 | Offset | Type | Description |
 | :--- | :--- | :--- |
-| `0x000` | `char[256]` | Magic string: `"EyedentityGames Packing File 01"` (null-padded) |
+| `0x000` | `char[256]` | Magic string: `"EyedentityGames Packing File 01"` (v11) or `"EyedentityGames Packing File 0.1"` (v10) (null-padded) |
 | `0x100` | `uint32` | Format version (`10` or `11`) |
 | `0x104` | `uint32` | Number of files in archive |
-| `0x108` | `uint32` | Absolute file offset to File Entry Table |
+| `0x108` | `uint32` | Absolute file offset to File Entry Table (in v10, calculated as `fileSize - fileCount * 316` if 0) |
 | `0x10C` | `uint32` | Reserved / padding |
 
 ### 2. File Entry Table (316 bytes / `0x13C` per file)
@@ -46,16 +46,24 @@ High-performance, cross-platform C++ archive packer, unpacker, and key extractor
 | `0x10C` | `uint32` | Absolute offset to file payload data |
 | `0x110` | `uint8[44]` | Reserved / alignment padding |
 
-### 3. Payload Encryption Scheme (`EwAF256`)
-Dragon Nest employs a two-tier AES-256-ECB encryption mechanism:
+### 3. Payload Schemes: Modern Encrypted vs Legacy Unencrypted
+
+#### Modern Encrypted (Version 11 / `EwAF256` Scheme)
+Modern archives use a two-tier AES-256-ECB encryption mechanism:
 1. **Header Block (16 bytes)**:
    - Decrypted using the **Master Header Key** (`0x8992FD01` $\rightarrow$ `"fTD6kNYM6vECvYVc3pUutQJ9ZiPoKxQ\0"`).
-   - Validated against the magic string `"EwAF256"`.
+   - Validated against magic `"EwAF256"`.
    - Next 8 ASCII bytes represent the 32-bit hex **Data Key ID** (e.g. `"9B6536B2"`).
 2. **Payload Body**:
    - Decrypted using the specific 32-byte AES-256 key corresponding to the Data Key ID.
    - Stripped of PKCS#7 padding.
    - Decompressed via zlib Deflate (`mz_uncompress`).
+
+#### Old / Legacy Unencrypted (Version 10 / Classic Scheme)
+Legacy Dragon Nest archives do not employ AES encryption:
+1. **Header**: Magic is `"EyedentityGames Packing File 0.1"`, Version is `10`.
+2. **Payload Body**: Direct raw zlib Deflate stream without any 16-byte `EwAF256` encryption prefix or AES cipher blocks.
+3. **Table Position**: The 316-byte entry array is written at the end of the archive (`fileSize - fileCount * 316`). `DNPacker` auto-detects and extracts both formats seamlessly.
 
 ---
 
@@ -111,32 +119,42 @@ The compiled static executable will be located at `build/bin/dnpacker`.
 
 ## Usage
 
-### 1. Drag & Drop (Windows)
-- **Unpack**: Drag any `.pak` file onto `dnpacker.exe`.
-- **Pack**: Drag any directory onto `dnpacker.exe`.
-- **Extract Keys**: Drag `dragonnest_x64.exe` onto `dnpacker.exe`.
+### 1. Drag & Drop (Windows Explorer)
+- **Drag Client Folder**: Drag a game client directory containing `.pak` files onto `dnpacker.exe` $\rightarrow$ automatically detects archives and defaults to batch unpacking and merging all assets into a unified `GameRes/` folder.
+- **Drag Multiple PAK Files**: Select and drag multiple `.pak` files onto `dnpacker.exe` $\rightarrow$ automatically unpacks each archive into its own folder.
+- **Drag Asset Folder**: Drag an extracted game folder onto `dnpacker.exe` $\rightarrow$ prompts to pack as **Modern Encrypted** or **Old Unencrypted**.
+- **Extract Keys**: Drag `dragonnest_x64.exe` onto `dnpacker.exe` $\rightarrow$ scans executable and generates `keys.txt`.
 
 ### 2. Command Line Interface (CLI)
 ```bash
-# Unpack entire archive
+# Unpack single archive
 dnpacker unpack Resource01.pak [output_directory]
 
-# Unpack only specific files (glob filter)
+# Batch unpack an entire game client directory into 'GameRes' (default)
+dnpacker unpack C:\DragonNest\Client
+# or specify custom target folder:
+dnpacker unpack C:\DragonNest\Client D:\MyGameRes
+
+# Batch unpack multiple specific PAK archives
+dnpacker unpack Resource01.pak Resource02.pak Patch00001110.pak
+
+# Unpack only specific files matching a filter
 dnpacker unpack Resource01.pak output_dir --filter "*.xml"
 
-# Pack a directory into a PAK archive (AES-256 encrypted)
+# Pack a directory into a modern encrypted PAK (Version 11, AES-256)
 dnpacker pack my_modded_folder output.pak
 
-# Pack without encryption
-dnpacker pack my_modded_folder output.pak --no-encrypt
+# Pack a directory into a legacy unencrypted PAK (Version 10, classic deflate)
+dnpacker pack my_modded_folder output.pak --old
+# or: dnpacker pack my_modded_folder output.pak --no-encrypt
 
 # Pack with a specific key ID (hex)
 dnpacker pack my_modded_folder output.pak --key 0x9B6536B2
 
-# List contents of an archive
+# List contents of an archive (shows offset, sizes, encryption status)
 dnpacker list Resource01.pak
 
-# Show archive header metadata
+# Show archive header metadata (version, file count, table offset)
 dnpacker info Resource01.pak
 
 # Scan executable and extract all encryption keys

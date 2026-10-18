@@ -14,6 +14,8 @@ constexpr uint32_t DEFAULT_DATA_KEY_ID = 0x9B6536B2;
 constexpr const char* DEFAULT_DATA_KEY_STR = "IodFUGvntOcxu2AplnA8yTBCZWxfZBP";
 
 constexpr const char* PAK_MAGIC = "EyedentityGames Packing File 01";
+constexpr const char* PAK_MAGIC_V10 = "EyedentityGames Packing File 0.1";
+constexpr const char* PAK_MAGIC_PREFIX = "EyedentityGames Packing File";
 constexpr const char* ENCRYPTION_MAGIC = "EwAF256";
 
 // Built-in known keys recovered from dragonnest_x64.exe (Eyedentity Games)

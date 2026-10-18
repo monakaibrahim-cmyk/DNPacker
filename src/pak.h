@@ -61,7 +61,8 @@ public:
         const std::filesystem::path& sourceDir,
         const std::filesystem::path& pakPath,
         bool encrypt = true,
-        uint32_t keyId = DEFAULT_DATA_KEY_ID
+        uint32_t keyId = DEFAULT_DATA_KEY_ID,
+        bool oldFormat = false
     );
 
     const std::vector<PakEntry>& GetEntries() const { return m_entries; }
